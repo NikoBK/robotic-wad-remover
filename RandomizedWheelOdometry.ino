@@ -1,0 +1,626 @@
+/*
+    Created by: Nikolaj Krebs,
+    Date: 10/9/2022 10:55PM
+*/ 
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Zumo32U4.h>
+#include <math.h>
+
+#define MOTOR_SPEED 100
+#define NUM_SENSORLEVELS 6
+#define TIME_INTERVAL 69000
+#define NUM_SENSORS 5
+#define DEBUG_MODE false
+
+Zumo32U4LCD LCD;
+Zumo32U4IMU IMU;
+Zumo32U4ButtonA ButtonA;
+Zumo32U4ProximitySensors ProximitySensors;
+Zumo32U4LineSensors LineSensors;
+
+uint16_t BrightnessLevels[] = { 1,1,3,3,5,5 };
+
+// Booleans that help the robot know how far in the process it is
+bool Rotating = false;
+bool ReachedDestination = false;
+bool NavFinished = false;
+bool Navigating = false;
+bool SensorReads = true;
+bool Bounce = true;
+bool Reset = true;
+
+
+//////////////////////// Odometry Constants and variables /////////////////////////
+int WheelDiameter = 4; // 4cm
+int DeltaT = 25;
+double CurrentX = 0;
+double CurrentY = 0;
+double DeltaX = 0;
+double DeltaY = 0;
+int GlobalTheta;
+double MomentaryTheta, TargetTheta, DeltaD;
+double VelocityR = 0;
+double VelocityL = 0;
+double FWDVelocity = 0;
+
+//////////////////////// MOTOR /////////////////////////
+Zumo32U4Motors Motors;
+Zumo32U4Encoders WheelEncoders;
+int DrivenDistance;
+int Angle;
+
+//////////////////////// LINE SENSORS /////////////////////////
+uint16_t SensorValues[NUM_SENSORS]; //Some array that contains the raw read values from the sensors between 0-2000
+bool UseEmitters = true;
+
+struct LineSensorStates {
+    bool Left;
+    bool LeftCenter;
+    bool Center;
+    bool RightCenter;
+    bool Right;
+};
+
+int ContrastThreshold; // White threshold, white return values lower than this
+LineSensorStates SensorStates = { false,false,false,false,false };
+
+////////////////Gyro setup/////////////////////
+int TurnAngleDegrees;
+
+/* turnAngle is a 32-bit unsigned integer representing the amount
+the robot has turned since the last time turnSensorReset was
+called.  This is computed solely using the Z axis of the gyro, so
+it could be inaccurate if the robot is rotated about the X or Y
+axes.
+Our convention is that a value of 0x20000000 represents a 45
+degree counter-clockwise rotation.  This means that a uint32_t
+can represent any angle between 0 degrees and 360 degrees.  If
+you cast it to a signed 32-bit integer by writing
+(int32_t)turnAngle, that integer can represent any angle between
+-180 degrees and 180 degrees. */
+uint32_t CurrentTurnAngle = 0;
+
+// This variable helps us keep track of how much time has passed
+// between readings of the gyro.
+uint16_t GyroLastUpdate = 0;
+
+// turnRate is the current angular rate of the gyro, in units of
+// 0.07 degrees per second.
+// GyroOffset is the average reading obtained from the gyro's Z axis
+// during calibration.
+int16_t TurnRate, GyroOffset;
+
+/// <summary>
+/// A single waypoint struct that represents a waypoint within a 2d frame
+/// </summary>
+struct Waypoint
+{
+    int X;
+    int Y;
+    Waypoint* next; // Chain reference to the next waypoint in queue (If queue is not NULL)
+
+    Waypoint(int x, int y) {
+        X = x;
+        Y = y;
+        next = NULL;
+    }
+};
+
+/// <summary>
+/// Debug log function that only logs if DEBUG_MODE is set to true.
+/// </summary>
+/// <param name="text"></param>
+void debugLog(String text) {
+    if (DEBUG_MODE)
+        Serial.println("[DEBUG]<" + (String)__TIME__ + ">: " + text);
+}
+
+/// <summary>
+/// The overall struct for the waypoint queue that contains a rear and front end for Waypoints.
+/// </summary>
+struct WaypointQueue
+{
+    Waypoint* Front, * Rear;
+
+    WaypointQueue() {
+        Front = Rear = NULL;
+    }
+
+    /// <summary>
+    /// Adds a waypoint to the queue
+    /// </summary>
+    /// <param name="x"></param>
+    /// <param name="y"></param>
+    void EnQueue(int x, int y)
+    {
+        Waypoint* temp = new Waypoint(x, y);
+
+        if (Rear == NULL) {
+            Front = Rear = temp;
+            return;
+        }
+
+        Rear->next = temp;
+        Rear = temp;
+        debugLog("Waypoint has been enqueued. Data (X): " + (String)temp->X + ", (Y): " + (String)temp->Y);
+    }
+
+    /// <summary>
+    /// Removes a waypoint from the queue
+    /// </summary>
+    void DeQueue()
+    {
+        if (Front == NULL) {
+            return;
+        }
+
+        Waypoint* temp = Front;
+        Front = Front->next;
+
+        if (Front == NULL) {
+            Rear = NULL;
+        }
+
+        //debugLog("Removed waypoint from queue. Data (X): " + (String)temp->X + ", (Y): " + (String)temp->Y);
+        delete(temp);
+        //debugLog("Removed. X value for the next waypoint in queue: " + (String)front->X)
+    }
+};
+
+WaypointQueue WaypointQueue_;
+
+// the setup function runs once when you press reset or power the board
+void setup() {
+    ConfigureComponents();
+}
+
+// the loop function runs over and over again until power down or reset
+void loop() {
+    WaypointQueue_.DeQueue();
+    if (WaypointQueue_.Front != NULL) {
+        BoundaryBounce();
+        MoveTo(WaypointQueue_.Front->X, WaypointQueue_.Front->Y);
+    }
+    else {
+        NavFinished = true;
+    }
+    if (NavFinished && Reset) {
+        Reset = false;
+        TurnAngle(0, 'R');
+        Motors.setSpeeds(-MOTOR_SPEED, -MOTOR_SPEED);
+        delay(1000);
+        Motors.setSpeeds(0, 0);
+    }
+}
+
+/// <summary>
+/// Called whenever a new front is detected in the queue. Turns the robot around
+/// and generates a new waypoint with respects to a randomized angle.
+/// </summary>
+void BoundaryBounce()
+{
+    TurnAngleNew(45, 'L');
+    Motors.setSpeeds(MOTOR_SPEED, MOTOR_SPEED);
+    while (Bounce) 
+    {
+        ReadSensors(SensorStates);
+        UpdatePosition();
+        long timeTaken = millis();
+        ProximitySensors.read();
+        if (ProximitySensors.countsFrontWithLeftLeds() >= 4 || ProximitySensors.countsFrontWithRightLeds() >= 4)
+        {
+            TurnAngleNew(100, 'R');
+            Motors.setSpeeds(MOTOR_SPEED, MOTOR_SPEED);
+        }
+        if (SensorStates.LeftCenter)
+        {
+            TurnAngleNew(100, 'R');
+            Motors.setSpeeds(MOTOR_SPEED, MOTOR_SPEED);
+        }
+        if (SensorStates.RightCenter)
+        {
+            TurnAngleNew(100, 'L');
+            Motors.setSpeeds(MOTOR_SPEED, MOTOR_SPEED);
+        }
+        if (timeTaken > TIME_INTERVAL)
+        {
+            Bounce = false;
+        }
+    }
+}
+
+/// <summary>
+/// Works the same as TurnAngle with extra compensation for randomized
+/// waypoints and angles
+/// </summary>
+/// <param name="desiredAngle"></param>
+/// <param name="Direction"></param>
+void TurnAngleNew(int desiredAngle, char Direction)
+{
+    switch (Direction)
+    {
+        case 'R':
+            UpdatePosition();
+            MomentaryTheta = GlobalTheta;
+
+            if (MomentaryTheta - desiredAngle <= 0)
+            {
+                TargetTheta = MomentaryTheta - desiredAngle + 360;
+            }
+            else
+            {
+                TargetTheta = MomentaryTheta - desiredAngle;
+            }
+            if (TargetTheta == 360)
+            {
+                TargetTheta = 0;
+            }
+
+            while (!Rotating) 
+            {
+                UpdatePosition();
+                if (GlobalTheta >= TargetTheta && (TargetTheta) >= GlobalTheta)
+                {
+                    Motors.setSpeeds(0, 0);
+                    Rotating = true;
+                }
+                else
+                {
+                    Motors.setSpeeds(MOTOR_SPEED, -MOTOR_SPEED * 1.2);
+                }
+            }
+            Rotating = false;
+        break;
+
+        case 'L':
+            UpdatePosition();
+            MomentaryTheta = GlobalTheta;
+            if (MomentaryTheta + desiredAngle > 360)
+            {
+                TargetTheta = MomentaryTheta + desiredAngle - 360;
+            }
+            else
+            {
+                TargetTheta = MomentaryTheta + desiredAngle;
+            }
+            if (TargetTheta == 360)
+            {
+                TargetTheta = 0;
+            }
+
+            while (!Rotating) 
+            {
+                UpdatePosition();
+                if (GlobalTheta >= TargetTheta && (TargetTheta + 1) >= GlobalTheta)
+                {
+                    Motors.setSpeeds(0, 0);
+                    Rotating = true;
+                }
+                else
+                {
+                    Motors.setSpeeds(-MOTOR_SPEED * 1.2, MOTOR_SPEED);
+                }
+            }
+            Rotating = false;
+        break;
+    }
+}
+
+/// <summary>
+/// The initial setup function for configuration the IMU's gyroscope
+/// </summary>
+void GyroscopeSetup() {
+    Wire.begin();
+    IMU.init();
+    IMU.enableDefault();
+    IMU.configureForTurnSensing();
+    LCD.clear();
+    LCD.print(F("Gyro cal"));
+
+    // Turn on the yellow LED in case the LCD is not available.
+    ledYellow(1);
+    // Calibrate the gyro.
+    int32_t total = 0;
+    int sampleIterations = 1024;
+    for (uint16_t i = 0; i < sampleIterations; i++) {
+        // Wait for new data to be available, then read it.
+        while (!IMU.gyroDataReady()) {} // Is this needed????
+        IMU.readGyro();
+        // Add the Z axis reading to the total.
+        total += IMU.g.z;
+    }
+    ledYellow(0);
+    GyroOffset = total / sampleIterations;
+    delay(250);
+    // Display the angle (in degrees from -180 to 180)
+    LCD.clear();
+}
+
+/// <summary>
+/// Resetting the current turned angle of the robot and the last update counter for the
+/// gyroscope
+/// </summary>
+void GyroscopeReset() {
+    GyroLastUpdate = micros();
+    CurrentTurnAngle = 0;
+}
+
+/// <summary>
+/// The turn function for the robot that turns to a given angle in degrees in a given direction
+/// that is represented by a char.
+/// </summary>
+/// <param name="goalAngle"></param>
+/// <param name="Direction"></param>
+void TurnAngle(int goalAngle, char Direction)
+{
+    switch (Direction)
+    {
+    case 'R':
+        GyroscopeUpdate();
+
+        while (!Rotating) 
+        {
+            UpdatePosition();
+            if (GlobalTheta >= goalAngle && (goalAngle) >= GlobalTheta) {
+                Motors.setSpeeds(0, 0);
+                Rotating = true;
+            }
+            else {
+                Motors.setSpeeds(MOTOR_SPEED, -MOTOR_SPEED * 0.85);
+            }
+        }
+        Rotating = false;
+        break;
+
+    case 'L':
+        GyroscopeUpdate();
+        while (!Rotating) 
+        {
+            UpdatePosition();
+            if (GlobalTheta >= goalAngle && (goalAngle) >= GlobalTheta) {
+                Motors.setSpeeds(0, 0);
+                Rotating = true;
+            }
+            else {
+                Motors.setSpeeds(-MOTOR_SPEED, MOTOR_SPEED);
+            }
+        }
+        Rotating = false;
+        break;
+    }
+}
+
+/// <summary>
+/// Returns a boolean value that represents whether the robot is at the desired
+/// location or not. This function also handles the difference between waypoints and current
+/// positions in the frame when it is moving from a negative position to a negative waypoint.
+/// </summary>
+/// <param name="negX"></param>
+/// <param name="negY"></param>
+/// <param name="x"></param>
+/// <param name="y"></param>
+/// <param name="inverseX"></param>
+/// <param name="inverseY"></param>
+/// <returns></returns>
+bool VerifyCurrentDestination(bool negX, bool negY, int x, int y, bool xInversed, bool yInversed)
+{
+    // Dear reader, we apologize for this cracked code but we are happy to inform you it works perfectly!
+    bool ret = false;
+    int equationLeftX = xInversed ? x : CurrentX;
+    int equationLeftY = yInversed ? y : CurrentY;
+    int equationRightX = xInversed ? CurrentX : x;
+    int equationRightY = yInversed ? CurrentY : y;
+
+    if (negX && negY) {
+        debugLog("Moving to a pos where: " + (String)equationLeftY + " <= " + (String)equationRightY);
+        ret = equationLeftX <= equationRightX && equationLeftY <= equationRightY ? true : false;
+    }
+    else if (!negX && !negY) {
+        debugLog("Moving to a pos where: " + (String)equationLeftY + " >= " + (String)equationRightY);
+        ret = equationLeftX >= equationRightX && equationLeftY >= equationRightY ? true : false;
+    }
+    else if (!negX && negY) {
+        debugLog("Moving to a pos where: " + (String)equationLeftY + " <= " + (String)equationRightY);
+        ret = equationLeftX >= equationRightX && equationLeftY <= equationRightY ? true : false;
+    }
+    else if (negX && !negY) {
+        debugLog("Moving to a pos where: " + (String)equationLeftY + " >= " + (String)equationRightY);
+        ret = equationLeftX <= equationRightX && equationLeftY >= equationRightY ? true : false;
+    }
+    return ret;
+}
+
+/// <summary>
+/// Rotates the robot and calls for a forward movement to the desired waypoint
+/// </summary>
+/// <param name="x"></param>
+/// <param name="y"></param>
+void MoveTo(int x, int y)
+{
+    Navigating = true;
+    int destx = x - CurrentX;
+    int desty = y - CurrentY;
+    char rotationalDirection;
+
+    // Converts from radians to degrees
+    int angleDeg = atan2(desty, destx) * 180 / PI;
+    Angle = (angleDeg + 360) % 360;
+
+    if (GlobalTheta > 245 && Angle < 90)
+    {
+        rotationalDirection = 'L';
+    }
+    else
+    {
+        rotationalDirection = 0 < Angle && Angle < 180 ? 'L' : 'R';
+    }
+
+    bool destXNeg = x < 0 ? true : false;
+    bool destYNeg = y < 0 ? true : false;
+    ReachedDestination = false;
+    TurnAngle(Angle, rotationalDirection);
+    MoveForward(x, y, destXNeg, destYNeg, Angle);
+}
+
+/// <summary>
+/// Moves the robot in a forward direction until it reaches a given destination
+/// </summary>
+/// <param name="x"></param>
+/// <param name="y"></param>
+/// <param name="destXneg"></param>
+/// <param name="destYneg"></param>
+/// <param name="angle"></param>
+void MoveForward(int x, int y, bool destXneg, bool destYneg, int angle)
+{
+    debugLog("Moving to x: " + (String)x + ", y: " + (String)y);
+    Motors.setSpeeds(MOTOR_SPEED, MOTOR_SPEED);
+    bool xInverse = CurrentX > (x - 5) && destXneg || CurrentX > (x + 5) && !destXneg ? true : false;
+    bool yInverse = CurrentY > (y - 5) && destYneg || CurrentY > (y + 5) && !destYneg ? true : false;
+    debugLog("X inverse: " + (String)xInverse + ", Y inverse: " + (String)yInverse);
+    while (!VerifyCurrentDestination(destXneg, destYneg, x, y, xInverse, yInverse) && !ReachedDestination)
+    {
+        if (0 < WheelEncoders.getCountsLeft() || 0 < WheelEncoders.getCountsRight()) {
+            UpdatePosition();
+        }
+    }
+    Motors.setSpeeds(0, 0);
+    ReachedDestination = true;
+    Navigating = false;
+    debugLog("Done! Current pos x: " + (String)CurrentX + ", y: " + (String)CurrentY);
+}
+
+/// <summary>
+/// Updates all the variables that is related to the gyroscope and position
+/// </summary>
+void GyroscopeUpdate()
+{
+    // Read the measurements from the gyro.
+    IMU.readGyro();
+    TurnRate = IMU.g.z - GyroOffset;
+
+    // Figure out how much time has passed since the last update (dt)
+    uint16_t m = micros();
+    uint16_t dt = m - GyroLastUpdate;
+    GyroLastUpdate = m;
+
+    // Multiply dt by turnRate in order to get an estimation of how
+    // much the robot has turned since the last update.
+    // (angular change = angular velocity * time)
+    int32_t d = (int32_t)TurnRate * dt;
+
+    // The units of d are gyro digits times microseconds.  We need
+    // to convert those to the units of turnAngle, where 2^29 units
+    // represents 45 degrees.  The conversion from gyro digits to
+    // degrees per second (dps) is determined by the sensitivity of
+    // the gyro: 0.07 degrees per second per digit.
+    //
+    // (0.07 dps/digit) * (1/1000000 s/us) * (2^29/45 unit/degree)
+    // = 14680064/17578125 unit/(digit*us)
+    CurrentTurnAngle += (int64_t)d * 14680064 / 17578125; // TODO: Add some comment
+
+    // Converts angle interval from [-180;180] to [0;360]
+    TurnAngleDegrees = ((((int32_t)CurrentTurnAngle >> 16) * 360) >> 16);
+
+    // Compensates for 360 degrees of freedom with angels that range from -360 to +360
+    if (TurnAngleDegrees <= 0 && TurnAngleDegrees >= -180) {
+        GlobalTheta = (360 + TurnAngleDegrees);
+    }
+    if (TurnAngleDegrees >= 0 && TurnAngleDegrees <= 180) {
+        GlobalTheta = TurnAngleDegrees;
+    }
+}
+
+/// <summary>
+/// Updates all the variables relevant to position and wheel encoders
+/// </summary>
+void UpdatePosition()
+{
+    GyroscopeUpdate();
+    float encL = WheelEncoders.getCountsLeft();
+    float encR = WheelEncoders.getCountsRight();
+    FWDVelocity = (((encL + encR) / 2) / 909.7 * (PI * WheelDiameter));
+    VelocityR = ((encR) / 909.7 * (PI * WheelDiameter));
+    VelocityL = ((encL) / 909.7 * (PI * WheelDiameter));
+    DeltaD = (VelocityR + VelocityL) / 2;
+    WheelEncoders.getCountsAndResetLeft();
+    WheelEncoders.getCountsAndResetRight();
+    DeltaX = (DeltaD * cos(GlobalTheta * (PI / 180)));
+    DeltaY = (DeltaD * sin(GlobalTheta * (PI / 180)));
+
+    CurrentX = CurrentX + DeltaX;
+    CurrentY = CurrentY + DeltaY;
+
+    LCD.clear();
+    LCD.gotoXY(0, 0);
+    LCD.print("x: " + (String)CurrentX);
+    LCD.gotoXY(0, 1);
+    LCD.print("y: " + (String)CurrentY);
+}
+
+/// <summary>
+/// Calibrates the line sensors to the preset Threshold for color contrasts
+/// </summary>
+void CalibrateLineSensors() 
+{
+    ButtonA.waitForPress();
+    Serial.println("Press A to calibrate WHITE");
+    delay(250);
+    ButtonA.waitForPress();
+
+    //takes the mean value of far left and right sensors and adds some margin to create a threshold
+    ContrastThreshold = ((SensorValues[1] + SensorValues[3]) / 2 + 20);
+    delay(250);
+    Serial.println(ContrastThreshold);
+}
+
+/// <summary>
+/// Handles sensor data and stores it in arrays.
+/// </summary>
+/// <param name="state"></param>
+void ReadSensors(LineSensorStates& state)
+{ 
+    LineSensors.read(SensorValues, UseEmitters ? QTR_EMITTERS_ON : QTR_EMITTERS_OFF); //Retrieves data from sensors
+
+    // state of the sensors is ALWAYS set to negative in the structure, so that the if 
+    // statements below only change the boolean to true when the conditions are met
+    state = { false,false,false,false,false };
+    if (SensorValues[0] < ContrastThreshold) {
+        state.Left = true;
+    }
+    if (SensorValues[1] < ContrastThreshold) {
+        state.LeftCenter = true;
+    }
+    if (SensorValues[2] < ContrastThreshold) {
+        state.Center = true;
+    }
+    if (SensorValues[3] < ContrastThreshold) {
+        state.RightCenter = true;
+    }
+    if (SensorValues[4] < ContrastThreshold) {
+        state.Right = true;
+    }
+}
+
+/// <summary>
+/// Configures the components and sets the initial values and properties required for the code to run
+/// properly
+/// </summary>
+void ConfigureComponents() {
+    Serial.begin(9600);
+    GyroscopeUpdate();
+    delay(500);
+    GyroscopeReset();
+    LCD.clear();
+    ButtonA.waitForPress();
+    delay(250);
+    ProximitySensors.initThreeSensors();
+    ProximitySensors.setBrightnessLevels(BrightnessLevels, sizeof(BrightnessLevels) / 2);
+    LineSensors.initFiveSensors(); // Initializes five sensors
+    ReadSensors(SensorStates);      //fills structure with first bools
+    CalibrateLineSensors();
+    WaypointQueue_.EnQueue(0, 20);
+    WaypointQueue_.EnQueue(0, 0);
+    MoveTo(WaypointQueue_.Front->X, WaypointQueue_.Front->Y);
+}
