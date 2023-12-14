@@ -20,9 +20,11 @@ There is a demonstrate for each solution that was designed for this project. Cli
 Please note that the white tape on the ground, on the systematic demonstration, serves only to show where the robot should be at a given time.
 
 
-[![Systematic Movement](https://img.youtube.com/vi/gVEl_OoKpGM/0.jpg)](https://www.youtube.com/watch?v=gVEl_OoKpGM)
+[![Systematic Movement](https://img.youtube.com/vi/zFcbfM9z1Tc/0.jpg)](https://www.youtube.com/watch?v=zFcbfM9z1Tc)\
+_(Click to watch)_
 
 
 ### Randomized solution
 
-[![Systematic Movement](https://img.youtube.com/vi/mmpaxL82iys/0.jpg)](https://www.youtube.com/watch?v=mmpaxL82iys)
+[![Systematic Movement](https://img.youtube.com/vi/gbJ69IQ7XTc/0.jpg)](https://www.youtube.com/shorts/gbJ69IQ7XTc)\
+_(Click to watch)_
